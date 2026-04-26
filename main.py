@@ -1,0 +1,343 @@
+import re
+import json
+import io
+import html
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+    CallbackQueryHandler
+)
+
+# ================= CONFIG =================
+TOKEN = "8244382896:AAHRnS5akHfPzDK0TNaZlaYHhJXuyexacUM"
+
+# ================= SESSION =================
+user_sessions = {}
+
+def reset_session(uid):
+    user_sessions[uid] = {
+        "step": "TIMER_TYPE", # New initial step
+        "quiz_title": None,
+        "quiz_id": None,
+        "section_type": None,
+        "manual_sections": None,
+        "timer_min": 60,
+        "is_sectional": False
+    }
+
+# ================= HTML ESCAPE =================
+def esc(txt):
+    if not txt: return ""
+    return (
+        txt.replace("&", "&amp;")
+           .replace("<", "&lt;")
+           .replace(">", "&gt;")
+           .replace("&lt;br&gt;", "<br>")
+    )
+
+# ================= EXISTING PARSING LOGIC (UNCHANGED) =================
+
+def parse_html_questions(html_content):
+    # Try Format 1: const questions = [...]
+    match1 = re.search(r'const\s+questions\s*=\s*(\[.*?\]);', html_content, re.DOTALL)
+    if match1:
+        return json.loads(match1.group(1))
+        
+    # फॉर्मेट 2: const quizData = { "questions": [...] } (आपका नया फॉर्मेट)
+    match2 = re.search(r'const\s+quizData\s*=\s*(\{.*?\});', html_content, re.DOTALL)
+    if match2:
+        full_data = json.loads(match2.group(1))
+        raw_questions = full_data.get("questions", [])
+        standardized = []
+        
+        for item in raw_questions:
+            # प्रश्न को स्प्लिट करना (English / Hindi)
+            text_content = item.get("text", "")
+            q_parts = text_content.split(" / ")
+            q_en = q_parts[0] if len(q_parts) > 0 else ""
+            q_hi = q_parts[1] if len(q_parts) > 1 else ""
+
+            # विकल्पों को स्प्लिट करना
+            opts_en = []
+            opts_hi = []
+            for opt in item.get("options", []):
+                if " / " in opt:
+                    o_parts = opt.split(" / ")
+                    opts_en.append(o_parts[0])
+                    opts_hi.append(o_parts[1])
+                else:
+                    opts_en.append(opt)
+                    opts_hi.append("") # अगर हिंदी नहीं है तो खाली छोड़ें
+
+            # समाधान (Explanation) को स्प्लिट करना
+            sol_content = item.get("explanation", "")
+            sol_parts = sol_content.split("<br><hr><br>")
+            sol_en = sol_parts[0] if len(sol_parts) > 0 else ""
+            sol_hi = sol_parts[1] if len(sol_parts) > 1 else ""
+
+            standardized.append({
+                "q_en": q_en,
+                "q_hi": q_hi,
+                "opts_en": opts_en,
+                "opts_hi": opts_hi,
+                "correct": item.get("correctIndex", 0) + 1, # 0-index को 1-index में बदलना
+                "standardized": standardized, # Variable exists in original code context
+                "sol_en": sol_en,
+                "sol_hi": sol_hi
+            })
+        return standardized
+
+    raise ValueError("प्रदान की गई HTML फ़ाइल में कोई भी समर्थित प्रश्न फॉर्मेट नहीं मिला।")
+
+# ================= COMMANDS =================
+async def quiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reset_session(update.effective_user.id)
+    keyboard = [
+        [InlineKeyboardButton("Standard (No Sectional Timer)", callback_data="type_std")],
+        [InlineKeyboardButton("Sectional Timer Mode", callback_data="type_sec")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("⏱ Choose Timer Configuration:", reply_markup=reply_markup)
+
+# ================= RESET COMMAND =================
+async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    reset_session(uid)
+    await update.message.reply_text("🔄 Session has been reset. Use /quiz to start again.")
+    
+# ================= CALLBACK HANDLER =================
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    uid = query.from_user.id
+    session = user_sessions.get(uid)
+    if not session: return
+
+    await query.answer()
+
+    # Step 1: Handle Timer Type Selection
+    if query.data.startswith("type_"):
+        session["is_sectional"] = (query.data == "type_sec")
+        keyboard = [
+            [InlineKeyboardButton("Default CGL (100Q)", callback_data="def_cgl")],
+            [InlineKeyboardButton("Give Manually", callback_data="sec_manual")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text("🚀 Select Exam Type:", reply_markup=reply_markup)
+
+    # Step 2: Handle Default/Manual Selection
+    elif query.data == "def_cgl":
+        session["section_type"] = "default"
+        if session["is_sectional"]:
+            session["manual_sections"] = (
+                "1. REASONING(1-25)-2-0.5-15\n"
+                "2. GK(26-50)-2-0.5-15\n"
+                "3. MATH(51-75)-2-0.5-15\n"
+                "4. ENGLISH(76-100)-2-0.5-15"
+            )
+        else:
+            session["manual_sections"] = (
+                "1. REASONING(1-25)-2-0.5\n"
+                "2. GK(26-50)-2-0.5\n"
+                "3. MATH(51-75)-2-0.5\n"
+                "4. ENGLISH(76-100)-2-0.5"
+            )
+        session["timer_min"] = 60
+        session["step"] = "TITLE"
+        await query.edit_message_text("✅ Default CGL Selected.\n\nPlease send the **Quiz Title**.")
+
+    elif query.data == "sec_manual":
+        session["section_type"] = "manual"
+        session["step"] = "MANUAL_SEC_INPUT"
+        format_hint = "SECTION NAME(START-END)-POS-NEG-TIME" if session["is_sectional"] else "SECTION NAME(START-END)-POS-NEG"
+        example_hint = "1. GK(1-50)-2-0.5-15" if session["is_sectional"] else "1. GK(1-50)-2-0.5"
+        await query.edit_message_text(f"Please provide sections manually:\nFormat: {format_hint}\n\nExample:\n{example_hint}")
+
+# ================= TEXT & FILE HANDLER =================
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    session = user_sessions.get(uid)
+    if not session: return
+
+    if session["step"] == "MANUAL_SEC_INPUT":
+        session["manual_sections"] = update.message.text.strip()
+        session["step"] = "TITLE"
+        await update.message.reply_text("✅ Sections Saved. Please send the **Quiz Title**.")
+        return
+
+    if session["step"] == "TITLE":
+        session["quiz_title"] = update.message.text.strip()
+        session["step"] = "ID"
+        await update.message.reply_text("✅ Title Saved. Please send the **Quiz ID**.")
+        return
+
+    if session["step"] == "ID":
+        session["quiz_id"] = update.message.text.strip()
+        session["step"] = "FILE"
+        await update.message.reply_text("✅ ID Saved. Please upload the **HTML File**.")
+        return
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    session = user_sessions.get(uid)
+    if not session or session["step"] != "FILE": return
+
+    doc = update.message.document
+    if not doc.file_name.endswith(".html"):
+        await update.message.reply_text("❌ Please upload a valid .html file.")
+        return
+
+    file = await context.bot.get_file(doc.file_id)
+    content = await file.download_as_bytearray()
+    html_text = content.decode("utf-8")
+
+    try:
+        raw_questions = parse_html_questions(html_text)
+        
+        # Structure the Output
+        sections_dict = {}
+        
+        sec_lines = session["manual_sections"].splitlines()
+        sec_map = []
+        for line in sec_lines:
+            # Modified regex to optionally capture the time parameter at the end
+            m = re.search(r'(?:[\d\.]+\s*)?(.*?)\((\d+)-(\d+)\)-([\d\.]+)-([\d\.]+)(?:-([\d\.]+))?', line)
+            if m:
+                sec_name = m.group(1).strip()
+                sec_time = m.group(6) if m.group(6) else "0"
+                sec_map.append({
+                    "name": sec_name,
+                    "start": int(m.group(2)),
+                    "end": int(m.group(3)),
+                    "pos": m.group(4),
+                    "neg": m.group(5),
+                    "time": int(float(sec_time) * 60)
+                })
+                # Initialize section based on mode
+                if session["is_sectional"]:
+                    sections_dict[sec_name] = {"time_seconds": int(float(sec_time) * 60), "questions": []}
+                else:
+                    sections_dict[sec_name] = []
+
+        for i, q in enumerate(raw_questions):
+            q_num = i + 1
+            current_sec_name = "MISC"
+            pos, neg = "2", "0.5"
+            
+            for s in sec_map:
+                if s["start"] <= q_num <= s["end"]:
+                    current_sec_name = s["name"]
+                    pos, neg = s["pos"], s["neg"]
+                    break
+
+            if current_sec_name not in sections_dict:
+                if session["is_sectional"]:
+                    sections_dict[current_sec_name] = {"time_seconds": 0, "questions": []}
+                else:
+                    sections_dict[current_sec_name] = []
+
+            item = {
+                "answer": str(q.get("correct", 1)),
+                "correct_score": pos,
+                "id": str(50000 + q_num),
+                "negative_score": neg,
+                "option_1": {
+                    "en": esc(q["opts_en"][0]), 
+                    "hi": esc(q["opts_hi"][0]) if (q.get("opts_hi") and len(q["opts_hi"]) > 0) else ""
+                },
+                "option_2": {
+                    "en": esc(q["opts_en"][1]), 
+                    "hi": esc(q["opts_hi"][1]) if (q.get("opts_hi") and len(q["opts_hi"]) > 1) else ""
+                },
+                "option_3": {
+                    "en": esc(q["opts_en"][2]), 
+                    "hi": esc(q["opts_hi"][2]) if (q.get("opts_hi") and len(q["opts_hi"]) > 2) else ""
+                },
+                "option_4": {
+                    "en": esc(q["opts_en"][3]), 
+                    "hi": esc(q["opts_hi"][3]) if (q.get("opts_hi") and len(q["opts_hi"]) > 3) else ""
+                },
+                "option_5": "",
+                "question": {"en": esc(q["q_en"]), "hi": esc(q.get("q_hi", ""))},
+                "quiz_id": session["quiz_id"],
+                "solution_text": {"en": esc(q.get("sol_en", "")), "hi": esc(q.get("sol_hi", ""))}
+            }
+            
+            if session["is_sectional"]:
+                sections_dict[current_sec_name]["questions"].append(item)
+            else:
+                sections_dict[current_sec_name].append(item)
+            
+        # FINAL OUTPUT STRUCTURE
+        output_data = {
+            "meta": {
+                "title": session["quiz_title"],
+                "id": session["quiz_id"],
+                "total_questions": len(raw_questions),
+                "correct_score": "2",
+                "negative_score": "0.5",
+                "timer_minutes": str(session["timer_min"]),
+                "timer_seconds": session["timer_min"] * 60
+            },
+            "sections": sections_dict
+        }
+
+        json_str = json.dumps(output_data, indent=4, ensure_ascii=False)
+        file_name = f"{session['quiz_title'].replace(' ', '_')}.json"
+        
+        caption = (
+            f"<b>✅ Quiz JSON Generated!</b>\n\n"
+            f"<b>📌 Mode:</b> {'Sectional Timer' if session['is_sectional'] else 'Standard'}\n"
+            f"<b>📝 Total Questions:</b> {len(raw_questions)}"
+        )
+
+        await update.message.reply_document(
+            document=io.BytesIO(json_str.encode("utf-8")),
+            filename=file_name,
+            caption=caption,
+            parse_mode="HTML"
+        )
+
+        # Website Snippet Logic
+        total_qs = len(raw_questions)
+        correct_val = 2 # session default
+        total_marks = total_qs * correct_val
+        timer_str = f"{session['timer_min']} Min"
+
+        website_code = (
+            f'{{"id": "{session["quiz_id"]}", '
+            f'"title": "{session["quiz_title"]}", '
+            f'"type": "paid", '
+            f'"releaseDate": "", '
+            f'"qs": {total_qs}, '
+            f'"time": "{timer_str}", '
+            f'"marks": {total_marks}}}'
+        )
+
+        await update.message.reply_text(
+            f"📋 <b>Website JSON Snippet:</b>\n\n"
+            f"<pre><code class='language-json'>{html.escape(website_code)}</code></pre>",
+            parse_mode="HTML"
+        )
+        
+        reset_session(uid)
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error processing file: {str(e)}")
+
+# ================= MAIN =================
+def main():
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("quiz", quiz_cmd))
+    app.add_handler(CommandHandler("reset", reset_cmd))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
+
