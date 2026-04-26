@@ -286,7 +286,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
 
         json_str = json.dumps(output_data, indent=4, ensure_ascii=False)
-        file_name = f"{session['quiz_title'].replace(' ', '_')}.json"
+        file_name = f"{session['quiz_id'].replace(' ', '_')}.json"
         
         caption = (
             f"<b>✅ Quiz JSON Generated!</b>\n\n"
