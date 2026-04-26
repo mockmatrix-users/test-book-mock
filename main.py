@@ -328,9 +328,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Error processing file: {str(e)}")
 
+
 # ================= MAIN =================
 def main():
-    app = ApplicationBuilder().token(TOKEN).build()
+    # Build the application with increased timeouts for large files
+    app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .connect_timeout(60) # Time allowed to connect to Telegram
+        .read_timeout(60)    # Time allowed to download the file data
+        .build()
+    )
     app.add_handler(CommandHandler("quiz", quiz_cmd))
     app.add_handler(CommandHandler("reset", reset_cmd))
     app.add_handler(CallbackQueryHandler(callback_handler))
